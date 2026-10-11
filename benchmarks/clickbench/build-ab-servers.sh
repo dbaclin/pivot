@@ -51,6 +51,12 @@ pgo_subset="$(expand_tilde "$pgo_subset")"
 export PATH="$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin"
 export NO_COLOR=1
 
+# A cold build on a many-core box runs one rustc per core, and the default
+# 1024 open-file soft limit of a login shell is exhausted before the leaf
+# crates finish ("Too many open files"). Raising the soft limit to the hard
+# limit needs no privileges and only affects this process tree.
+ulimit -Sn "$(ulimit -Hn)"
+
 command -v ld.lld >/dev/null || {
     echo "error: ld.lld is not installed, and the instrumented build links with it" >&2
     echo "       (instrumentation grows the text past the aarch64 128MB branch" >&2
