@@ -2,15 +2,17 @@
 //! transaction resolve derives from its snapshot, so a query's filter pushdown
 //! prunes its own view without affecting anyone else.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
 use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, equality_predicates, estimate_distinct_count,
+    estimate_filtered_row_count, materialize, prune_parquet, row_group_filter_from,
+    scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
@@ -20,6 +22,12 @@ use planner::expression::{CompareType, Expression};
 
 use super::CatalogTable;
 use super::insert_sink::{UploadedFile, build_insert_spec};
+
+/// Distinct-count estimates already measured for a datastore's tables, keyed
+/// by table id, table version and storage column. A table version's data never
+/// changes, so an estimate stays valid until the table advances; every binding
+/// of the datastore shares the map, so each column is sampled once.
+pub(crate) type DistinctCountCache = Arc<Mutex<HashMap<(uuid::Uuid, u64, usize), u64>>>;
 
 /// A catalog table resolved from one transaction: it captures the snapshot's own
 /// copy of the [`CatalogTable`] (schema, files, and their row groups), this
@@ -47,11 +55,27 @@ pub struct TableBinding {
     /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
     predicates: Vec<PushedPredicate>,
+    /// Every filter pushed into this binding, as offered: the planning
+    /// estimate measures their selectivity on a sample of the table.
+    filters: Vec<Expression>,
     /// The transaction's shared queue of finished INSERT files. Shared (`Arc`)
     /// with the [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
     /// binding, so a file this binding's [`compile_insert`](BoundTable::compile_insert)
     /// pushes is drained by that transaction's commit.
     uploaded_files: Arc<Injector<UploadedFile>>,
+    /// The datastore's worker pool, on which the planning-time samples are read.
+    dispatcher: DataFlowDispatcher,
+    /// The datastore's distinct-count estimates, shared by all of its bindings.
+    distinct_counts: DistinctCountCache,
+    /// The view this binding scans (its files partition-pruned, then its row
+    /// groups stats-pruned by the pushed predicates), built once: walking a
+    /// large table's row groups costs tens of milliseconds, and the planner
+    /// asks for the scan's size several times. Cleared by a new predicate.
+    scan_view: OnceLock<Arc<ParquetTable>>,
+    /// The scan's estimated row count, measured once per set of pushed filters.
+    row_estimate: OnceLock<u64>,
+    /// The table's whole, unfiltered view, built once for its distinct counts.
+    whole_view: OnceLock<Arc<ParquetTable>>,
 }
 
 impl std::fmt::Debug for TableBinding {
@@ -66,11 +90,14 @@ impl std::fmt::Debug for TableBinding {
 
 impl TableBinding {
     /// A binding over the snapshot's `table` copy, sharing the transaction's
-    /// `uploaded_files` injector, with no predicates pushed yet.
+    /// `uploaded_files` injector and the datastore's `dispatcher` and
+    /// `distinct_counts`, with no predicates pushed yet.
     pub(super) fn new(
         reference: TableReference,
         table: CatalogTable,
         uploaded_files: Arc<Injector<UploadedFile>>,
+        dispatcher: DataFlowDispatcher,
+        distinct_counts: DistinctCountCache,
     ) -> Self {
         let columns = table.columns();
         let nullability = table.nullability();
@@ -80,8 +107,28 @@ impl TableBinding {
             columns,
             nullability,
             predicates: Vec::new(),
+            filters: Vec::new(),
             uploaded_files,
+            dispatcher,
+            distinct_counts,
+            scan_view: OnceLock::new(),
+            row_estimate: OnceLock::new(),
+            whole_view: OnceLock::new(),
         }
+    }
+
+    /// The view this binding scans: the captured snapshot's files, partition-
+    /// pruned by the pushed equality predicates, with the row groups the pushed
+    /// predicates' stats eliminate removed. Built on first use and kept, so a
+    /// scan, its late materialize and the planning estimates all address the
+    /// same global row-group indices.
+    fn scan_view(&self) -> CatalogResult<Arc<ParquetTable>> {
+        if let Some(view) = self.scan_view.get() {
+            return Ok(view.clone());
+        }
+        let current = self.resolve_files()?;
+        let view = Arc::new(self.pruned_parquet(&current));
+        Ok(self.scan_view.get_or_init(|| view).clone())
     }
 
     /// This table's row groups in the captured snapshot, partition-pruned by the
@@ -163,16 +210,13 @@ impl BoundTable for TableBinding {
         emit_row_group_metadata: bool,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         // The captured snapshot copy hands back the file set this query was
-        // bound against, partition-pruned. All in-memory: the background
-        // refresh already materialized every footer.
-        let current = self.resolve_files()?;
+        // bound against, partition-pruned and stats-pruned. All in-memory: the
+        // background refresh already materialized every footer.
+        let parquet = self.scan_view()?;
 
         // A variant path predicate reaches its shredded typed leaf only in the
         // files that shred it, so each row group resolves the path itself.
         let eq_predicates = equality_predicates(&self.predicates);
-
-        // Prune the row groups by the pushed-down predicates' stats.
-        let parquet = Arc::new(self.pruned_parquet(&current));
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
@@ -221,17 +265,12 @@ impl BoundTable for TableBinding {
         projection: Projection,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         // A row reference is a position in the *scanning* view's flat row-group
-        // list, so this has to build the identical view: same captured
-        // snapshot, same partition pruning, and the same stats pruning
-        // [`compile_scan`](BoundTable::compile_scan) applies. Re-reading from a
-        // view that kept even one row group the scan dropped shifts every later
-        // index and silently returns another row group's rows.
-        let current = self.resolve_files()?;
-        Ok(materialize(
-            input,
-            Arc::new(self.pruned_parquet(&current)),
-            projection,
-        ))
+        // list, so this reads the identical view
+        // [`compile_scan`](BoundTable::compile_scan) scans: same captured
+        // snapshot, same partition pruning, same stats pruning. Re-reading from
+        // a view that kept even one row group the scan dropped would shift
+        // every later index and silently return another row group's rows.
+        Ok(materialize(input, self.scan_view()?, projection))
     }
 
     fn pushdown_filter(&mut self, filter: Expression) -> CatalogResult<bool> {
@@ -241,6 +280,10 @@ impl BoundTable for TableBinding {
         // so this is purely an optimization and never affects correctness.
         self.predicates
             .extend(PushedPredicate::from_filter(&filter));
+        self.filters.push(filter);
+        // The scan view and its size now describe fewer rows.
+        self.scan_view = OnceLock::new();
+        self.row_estimate = OnceLock::new();
 
         Ok(false)
     }
@@ -269,19 +312,56 @@ impl BoundTable for TableBinding {
     }
 
     fn estimate_row_count(&self) -> Option<u64> {
-        // A planning estimate wants the base table's full size: pushed
-        // predicates and partition pruning deliberately don't apply, since the
-        // cost model accounts for filter selectivity itself. Build the whole
-        // (unfiltered) view over the captured snapshot and sum the footers'
-        // row-group counts.
-        let parquet = self.table.build_scan_view(&[], &[]).ok()?;
-        Some(
-            parquet
-                .row_groups()
-                .iter()
-                .map(|rg| rg.num_rows as u64)
-                .sum(),
-        )
+        if let Some(&rows) = self.row_estimate.get() {
+            return Some(rows);
+        }
+        // The planning estimate is the scan's own size: the row groups the
+        // pushed predicates keep (the view `compile_scan` reads), scaled by the
+        // selectivity the filters show on a sample of them.
+        let parquet = self.scan_view().ok()?;
+        let rows = match estimate_filtered_row_count(&self.dispatcher, &parquet, &self.filters) {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    table = ?self.reference,
+                    %error,
+                    "could not sample the scan's selectivity; estimating its unfiltered size"
+                );
+                parquet.total_rows() as u64
+            }
+        };
+        Some(*self.row_estimate.get_or_init(|| rows))
+    }
+
+    fn column_distinct_count(&self, column: usize) -> Option<u64> {
+        // A distinct count describes the whole table at its captured version,
+        // so it is measured once per version and shared through the datastore.
+        let key = (self.table.id(), self.table.version(), column);
+        if let Some(&count) = self.distinct_counts.lock().unwrap().get(&key) {
+            return Some(count);
+        }
+        let parquet = match self.whole_view.get() {
+            Some(view) => view.clone(),
+            None => {
+                let view = self.table.build_scan_view(&[], &[]).ok()?;
+                self.whole_view.get_or_init(|| view).clone()
+            }
+        };
+        match estimate_distinct_count(&self.dispatcher, &parquet, column) {
+            Ok(count) => {
+                self.distinct_counts.lock().unwrap().insert(key, count);
+                Some(count)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    table = ?self.reference,
+                    column,
+                    %error,
+                    "could not sample the column's distinct count"
+                );
+                None
+            }
+        }
     }
 }
 

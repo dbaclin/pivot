@@ -537,15 +537,24 @@ pub trait BoundTable: Debug + Send + Sync {
         None
     }
 
-    /// The table's estimated total row count for cost-based planning (join
-    /// ordering, hash-join build/probe side choice). Unlike
-    /// [`row_count`](BoundTable::row_count) this is an estimate, not an exact
-    /// answer: predicates pushed into this binding don't invalidate it, since
-    /// the cost model wants the base table's size and applies filter
-    /// selectivity itself. `None` means unknown; the planner then uses its own
-    /// defaults. Answered from the binding's captured snapshot, as in
-    /// [`compile_scan`](BoundTable::compile_scan).
+    /// The estimated number of rows this binding's scan produces, for
+    /// cost-based planning (join ordering, hash-join build/probe side choice).
+    /// Unlike [`row_count`](BoundTable::row_count) this is an estimate, not an
+    /// exact answer, and it accounts for the predicates pushed into this
+    /// binding: a scan the planner expects to keep few rows is estimated small,
+    /// whatever the base table's size. `None` means unknown; the planner then
+    /// uses its own defaults. Answered from the binding's captured snapshot, as
+    /// in [`compile_scan`](BoundTable::compile_scan).
     fn estimate_row_count(&self) -> Option<u64> {
+        None
+    }
+
+    /// The estimated number of distinct non-null values in `column` (a storage
+    /// index) over the whole table, for cost-based planning: a join's output is
+    /// sized by the domain of its key columns, and an equality filter by how
+    /// many values it picks one of. `None` means unknown; the planner then uses
+    /// its own defaults.
+    fn column_distinct_count(&self, _column: usize) -> Option<u64> {
         None
     }
 }
@@ -593,6 +602,10 @@ impl DuckDBTable for DuckDBTableAdapter {
 
     fn estimate_row_count(&self) -> Option<u64> {
         self.table.estimate_row_count()
+    }
+
+    fn column_distinct_count(&self, column: usize) -> Option<u64> {
+        self.table.column_distinct_count(column)
     }
 }
 

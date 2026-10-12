@@ -10,9 +10,10 @@
 //!   reuse.
 //!
 //! [`types`] (the table, row-group metadata, pages, requests), [`pushdown`]
-//! (static filter pushdown shared by catalog and external bindings), and
+//! (static filter pushdown shared by catalog and external bindings),
 //! [`row_group_stats`] (min/max elimination shared by static and dynamic
-//! filters) are common to both.
+//! filters) and [`sampling`] (planning-time selectivity and distinct-count
+//! estimates read off a few row groups) are common to both.
 
 #![allow(rustdoc::private_intra_doc_links)]
 
@@ -54,6 +55,9 @@ pub use metadata::{file_row_groups_from_metadata, load_file_row_groups};
 
 mod pushdown;
 pub use pushdown::{PushedPredicate, equality_predicates, prune_parquet};
+
+mod sampling;
+pub use sampling::{Error as SamplingError, estimate_distinct_count, estimate_filtered_row_count};
 
 mod row_group_stats;
 pub use row_group_stats::{

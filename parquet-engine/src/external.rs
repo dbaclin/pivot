@@ -17,8 +17,8 @@ use planner::expression::Expression;
 use planner::types::{Type, type_from_physical};
 
 use crate::{
-    ParquetTable, PushedPredicate, is_variant_field, materialize, prune_parquet,
-    table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, estimate_distinct_count, estimate_filtered_row_count,
+    is_variant_field, materialize, prune_parquet, table_input_with_filter_and_eq_predicates,
 };
 use object_storage::{
     DataFile, ExternalStoreFactory, FileRef, ObjectPath, ObjectStore, StoreScheme, local_path,
@@ -65,12 +65,27 @@ pub fn bind_read_parquet(
     Ok(Box::new(table))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ExternalParquetTable {
     location: String,
     columns: Vec<Column>,
     parquet: Arc<ParquetTable>,
     predicates: Vec<PushedPredicate>,
+    /// Every filter pushed into this binding, as offered: the planning
+    /// estimate measures their selectivity on a sample of the files.
+    filters: Vec<Expression>,
+    /// The worker pool the planning-time samples are read on.
+    dispatcher: DataFlowDispatcher,
+}
+
+impl std::fmt::Debug for ExternalParquetTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalParquetTable")
+            .field("location", &self.location)
+            .field("predicates", &self.predicates)
+            .field("filters", &self.filters)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BoundTable for ExternalParquetTable {
@@ -148,6 +163,7 @@ impl BoundTable for ExternalParquetTable {
     fn pushdown_filter(&mut self, filter: Expression) -> CatalogResult<bool> {
         self.predicates
             .extend(PushedPredicate::from_filter(&filter));
+        self.filters.push(filter);
         // Statistics and dictionaries may skip work, but the SQL filter stays
         // above the scan and remains responsible for query correctness.
         Ok(false)
@@ -161,7 +177,35 @@ impl BoundTable for ExternalParquetTable {
     }
 
     fn estimate_row_count(&self) -> Option<u64> {
-        Some(self.parquet.total_rows() as u64)
+        // The scan's own size: the row groups its pushed predicates keep, scaled
+        // by the selectivity the filters show on a sample of them.
+        let parquet = prune_parquet(&self.parquet, &self.predicates);
+        match estimate_filtered_row_count(&self.dispatcher, &parquet, &self.filters) {
+            Ok(rows) => Some(rows),
+            Err(error) => {
+                tracing::warn!(
+                    location = %self.location,
+                    %error,
+                    "could not sample the scan's selectivity; estimating its unfiltered size"
+                );
+                Some(parquet.total_rows() as u64)
+            }
+        }
+    }
+
+    fn column_distinct_count(&self, column: usize) -> Option<u64> {
+        match estimate_distinct_count(&self.dispatcher, &self.parquet, column) {
+            Ok(count) => Some(count),
+            Err(error) => {
+                tracing::warn!(
+                    location = %self.location,
+                    column,
+                    %error,
+                    "could not sample the column's distinct count"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -179,6 +223,8 @@ fn bind_external_table(
         columns,
         parquet: Arc::new(parquet),
         predicates: Vec::new(),
+        filters: Vec::new(),
+        dispatcher: dispatcher.clone(),
     })
 }
 

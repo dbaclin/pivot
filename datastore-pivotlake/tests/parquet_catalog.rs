@@ -2414,3 +2414,55 @@ fn late_materialization_rows_satisfy_their_own_predicate() {
         .collect();
     assert_eq!(bands, vec![6; 4]);
 }
+
+/// A table of `(id, name)` rows adopted from one file holding `ids`.
+fn id_table(ids: &[i32]) -> (TempDir, Arc<PivotlakeDatastore>) {
+    let dir = TempDir::new().unwrap();
+    write_ids(dir.path(), "data.parquet", ids);
+    let (database, datastore) = empty_datastore();
+    let (_, columns) = three_row_table();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    (database, datastore)
+}
+
+fn bind_t(datastore: &Arc<PivotlakeDatastore>) -> TableBinding {
+    datastore
+        .clone()
+        .begin_transaction()
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_pushed_filter_scales_the_row_estimate_by_its_selectivity() {
+    let ids: Vec<i32> = (0..100).collect();
+    let (_database, datastore) = id_table(&ids);
+    let mut table = bind_t(&datastore);
+    let unfiltered = table.estimate_row_count();
+
+    table
+        .pushdown_filter(constant_comparison(
+            0,
+            CompareType::GreaterEqual,
+            int_constant(70),
+        ))
+        .unwrap();
+
+    assert_eq!(unfiltered, Some(100));
+    assert_eq!(table.estimate_row_count(), Some(30));
+}
+
+#[test]
+fn a_column_distinct_count_is_measured_from_the_table() {
+    let ids: Vec<i32> = (0..100).map(|i| i % 10).collect();
+    let (_database, datastore) = id_table(&ids);
+    let table = bind_t(&datastore);
+
+    let ids_distinct = table.column_distinct_count(0);
+    let names_distinct = table.column_distinct_count(1);
+
+    assert_eq!((ids_distinct, names_distinct), (Some(10), Some(10)));
+}
