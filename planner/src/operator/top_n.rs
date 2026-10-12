@@ -1,10 +1,10 @@
 //! [`TopN`] — combined ORDER BY + LIMIT (returns the top N rows).
 
-use super::{OrderByDirection, OrderByNode};
+use super::OrderByNode;
 use crate::compile::{Error, RuntimeFilterSlots};
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::Expression;
-use dispatch::{OrderBy as DispatchOrderBy, RecordBatchOperatorSpec};
+use dispatch::RecordBatchOperatorSpec;
 use std::fmt;
 
 /// Combined ORDER BY + LIMIT (returns the top N rows).
@@ -49,8 +49,7 @@ impl TopN {
                     Expression::Ref(r) => Ok(r.column_idx),
                     expr => Err(Error::UnsupportedTopKExpression(expr.clone())),
                 }?;
-                let descending = matches!(node.direction, OrderByDirection::Desc);
-                Ok(DispatchOrderBy::new(col, descending, false))
+                Ok(node.to_dispatch(col))
             })
             .collect::<Result<Vec<_>, _>>()?;
         // If DuckDB's Top-N optimizer marked this node as a dynamic-filter

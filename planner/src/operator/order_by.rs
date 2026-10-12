@@ -46,12 +46,23 @@ impl fmt::Display for OrderByDirection {
 #[derive(Debug)]
 pub struct OrderByNode {
     pub direction: OrderByDirection,
+    /// Whether NULL keys sort before every non-NULL key (`NULLS FIRST`)
+    /// rather than after them (`NULLS LAST`), regardless of direction.
+    pub nulls_first: bool,
     pub expression: Expression,
+}
+
+impl OrderByNode {
+    pub(crate) fn to_dispatch(&self, column_idx: usize) -> DispatchOrderBy {
+        let descending = matches!(self.direction, OrderByDirection::Desc);
+        DispatchOrderBy::new(column_idx, descending, self.nulls_first)
+    }
 }
 
 impl fmt::Display for OrderByNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.expression, self.direction)
+        let nulls = if self.nulls_first { "FIRST" } else { "LAST" };
+        write!(f, "{} {} NULLS {nulls}", self.expression, self.direction)
     }
 }
 
@@ -87,8 +98,7 @@ impl OrderBy {
                     Expression::Ref(r) => Ok(r.column_idx),
                     expr => Err(Error::UnsupportedOrderByExpression(expr.clone())),
                 }?;
-                let descending = matches!(node.direction, OrderByDirection::Desc);
-                Ok(DispatchOrderBy::new(col, descending, false))
+                Ok(node.to_dispatch(col))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(if normalize_variants {
