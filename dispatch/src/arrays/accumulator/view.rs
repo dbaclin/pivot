@@ -57,7 +57,7 @@ pub(super) struct ViewColumn {
     /// The position on `buffers` of the block copied values are going into.
     /// Retained buffers can follow it on the list, so it need not be the last
     /// entry.
-    filling: Option<usize>,
+    open_block_idx: Option<usize>,
     validity: ValidityMask,
     /// Per-batch rebase cache for multi-batch appends: the buffer-list position
     /// a batch's data buffers were registered at. An entry is live only while
@@ -126,7 +126,7 @@ impl ViewColumn {
             capacity,
             views: allocator.create_slab_buffer(capacity, false),
             buffers: Vec::new(),
-            filling: None,
+            open_block_idx: None,
             validity: ValidityMask::new(capacity),
             batch_bases: Vec::new(),
             generation: 1,
@@ -324,7 +324,12 @@ impl ViewColumn {
                 let buffer = (view >> 64) as u32 as usize;
                 let offset = (view >> 96) as u32 as usize;
                 let value = &source_buffers[buffer][offset..offset + length as usize];
-                copy_value(&mut self.buffers, &mut self.filling, value, allocator)
+                copy_value(
+                    &mut self.buffers,
+                    &mut self.open_block_idx,
+                    value,
+                    allocator,
+                )
             };
             // SAFETY: the slab has room for `destination_start` plus the appended
             // rows, which the caller checked against the capacity.
@@ -413,7 +418,7 @@ impl ColumnAccumulator for ViewColumn {
         self.generation += 1;
         let fresh = allocator.create_slab_buffer(self.capacity, false);
         let views = std::mem::replace(&mut self.views, fresh).into_buffer(len * size_of::<u128>());
-        self.filling = None;
+        self.open_block_idx = None;
         let buffers: Vec<Buffer> = std::mem::take(&mut self.buffers)
             .into_iter()
             .map(DataBlock::into_buffer)
@@ -447,19 +452,12 @@ fn source_parts(source: &ArrayRef) -> (&[u128], &[Buffer], Option<&NullBuffer>) 
     }
 }
 
-/// Copy `value` into the block being filled, the one at `filling`, opening one
-/// (or a larger one for an outsized value) as needed, and return the view
-/// naming where it landed.
-///
-/// The block being filled is tracked by position rather than taken to be the
-/// last entry, because other entries (retained source buffers, oversized
-/// values) can be pushed after it. Opening a fresh block whenever one of those
-/// came last would leave a mostly empty block behind each time, and under a
-/// filter that alternates between retaining and copying sources those blocks
-/// alone can fill the pool.
+/// Copy `value` into the block being filled, the one at `open_block_idx`,
+/// opening one (or a larger one for an outsized value) as needed, and return
+/// the view naming where it landed.
 pub fn copy_value(
     blocks: &mut Vec<DataBlock>,
-    filling: &mut Option<usize>,
+    open_block_idx: &mut Option<usize>,
     value: &[u8],
     allocator: &mut SlabAllocator,
 ) -> u128 {
@@ -467,7 +465,7 @@ pub fn copy_value(
         blocks.push(DataBlock::OversizedValue(value.to_vec()));
         return make_view(value, blocks.len() as u32 - 1, 0);
     }
-    let free = match filling.map(|block| &blocks[block]) {
+    let free = match open_block_idx.map(|block| &blocks[block]) {
         Some(DataBlock::Slab { size, used, .. }) => size - used,
         Some(_) => unreachable!("the block being filled is always a slab block"),
         None => 0,
@@ -481,9 +479,9 @@ pub fn copy_value(
             size,
             used: 0,
         });
-        *filling = Some(blocks.len() - 1);
+        *open_block_idx = Some(blocks.len() - 1);
     }
-    let block = filling.expect("a block was just ensured");
+    let block = open_block_idx.expect("a block was just ensured");
     let DataBlock::Slab { slab, used, .. } = &mut blocks[block] else {
         unreachable!("the block being filled is always a slab block")
     };
